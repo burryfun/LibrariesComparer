@@ -2,6 +2,8 @@
 
 **LibrariesComparer** is a .NET 8 console application for analyzing project dependencies (NuGet and local DLLs), comparing with previous snapshots, and generating reports (JSON, Excel, HTML).
 
+![alt text](image.png)
+
 ## Features
 
 - Recursively searches for all `.csproj` files in the specified directory.
