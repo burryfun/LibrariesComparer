@@ -8,7 +8,7 @@
 
 - Recursively searches for all `.csproj` files in the specified directory.
 - Extracts NuGet packages (`PackageReference`) and local DLLs (`Reference`).
-- Retrieves information about versions, release dates, NuGet links, and local DLLs.
+- Retrieves information about versions, release dates, vulnerabilities, deprecates.
 - Compares with the previous snapshot:
   - New libraries - green color.
   - Changed versions - yellow color.
