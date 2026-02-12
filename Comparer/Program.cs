@@ -1,6 +1,7 @@
 ﻿using NuGet.Versioning;
 using OfficeOpenXml;
 using OfficeOpenXml.Style;
+using System.Collections.Concurrent;
 using System.Drawing;
 using System.Net;
 using System.Text.Json;
@@ -41,6 +42,16 @@ public class DeprecationInfo
     public string AlternatePackageId { get; set; }
 }
 
+public class NuGetCacheEntry
+{
+    public string ReleaseDate { get; set; }
+    public string Url { get; set; }
+    public List<VulnerabilityInfo> Vulnerabilities { get; set; }
+    public DeprecationInfo Deprecation { get; set; }
+    public string ResolvedVersion { get; set; }
+    public DateTime CachedAt { get; set; }
+}
+
 class Program
 {
     private static readonly HttpClient HttpClient = new(new HttpClientHandler
@@ -48,9 +59,14 @@ class Program
         AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate
     });
 
+    private static Dictionary<string, NuGetCacheEntry> _persistentCache = new();
+    private static readonly string CacheDirectory = Path.Combine(Directory.GetCurrentDirectory(), "cache");
+    private static readonly string CacheFilePath = Path.Combine(CacheDirectory, "nuget_metadata_cache.json");
+
     static Program()
     {
         HttpClient.DefaultRequestHeaders.Add("User-Agent", "LibraryComparerBot/1.0");
+        LoadCache();
     }
 
     static async Task Main(string[] args)
@@ -74,7 +90,10 @@ class Program
             // 2. Получаем информацию из NuGet
             var libraries = await GetLibrariesInfoAsync(allPackages);
 
-            // 3. Сравнение с прошлым снэпшотом
+            // 3. Сохраняем кэш после получения всей информации
+            SaveCache();
+
+            // 4. Сравнение с прошлым снэпшотом
             var snapshotDir = Path.Combine(Directory.GetCurrentDirectory(), "snapshots");
             Directory.CreateDirectory(snapshotDir);
             List<LibraryInfo> prevLibraries = LoadPreviousLibraries(snapshotDir);
@@ -205,45 +224,60 @@ class Program
 
     private static async Task<List<LibraryInfo>> GetLibrariesInfoAsync(List<(string Project, string Name, string Version, string ReleaseDate, string NugetUrl, bool IsDll)> allPackages)
     {
-        int total = allPackages.Count;
-        int processed = 0;
         var libraries = new List<LibraryInfo>();
+        
+        // 1. Отделяем DLL (они уже имеют инфо)
+        var dllPackages = allPackages.Where(p => p.IsDll).ToList();
+        foreach (var pkg in dllPackages)
+        {
+            libraries.Add(new LibraryInfo
+            {
+                Name = pkg.Name,
+                Version = pkg.Version,
+                ReleaseDate = pkg.ReleaseDate,
+                Project = pkg.Project,
+                NugetUrl = pkg.NugetUrl
+            });
+        }
 
-        const int maxConcurrency = 16;
+        // 2. Группируем NuGet пакеты по Имени и Версии для дедупликации запросов
+        var nugetPackages = allPackages.Where(p => !p.IsDll).ToList();
+        var uniquePackages = nugetPackages
+            .GroupBy(p => new { p.Name, p.Version })
+            .Select(g => new { g.Key.Name, g.Key.Version, Instances = g.ToList() })
+            .ToList();
+
+        int totalUnique = uniquePackages.Count;
+        int processedUnique = 0;
+        
+        Console.WriteLine($"Уникальных NuGet пакетов для проверки: {totalUnique} (всего в проектах: {nugetPackages.Count})");
+
+        const int maxConcurrency = 32;
         var semaphore = new SemaphoreSlim(maxConcurrency);
-        var tasks = allPackages.Select(async pkg =>
+        
+        var tasks = uniquePackages.Select(async uniquePkg =>
         {
             await semaphore.WaitAsync();
             try
             {
-                int current = Interlocked.Increment(ref processed);
-                Console.WriteLine($"[{current}/{total}] Пакет: {pkg.Name} {pkg.Version ?? ""} (проект: {pkg.Project})");
-                if (pkg.IsDll)
+                var info = await GetNugetInfo(uniquePkg.Name, uniquePkg.Version);
+                int current = Interlocked.Increment(ref processedUnique);
+                
+                if (current % 10 == 0 || current == totalUnique)
                 {
-                    // DLL: не делаем запрос к NuGet
-                    lock (libraries)
-                    {
-                        libraries.Add(new LibraryInfo
-                        {
-                            Name = pkg.Name,
-                            Version = pkg.Version,
-                            ReleaseDate = pkg.ReleaseDate,
-                            Project = pkg.Project,
-                            NugetUrl = pkg.NugetUrl
-                        });
-                    }
+                    Console.WriteLine($"[{current}/{totalUnique}] Обработано уникальных пакетов...");
                 }
-                else
+
+                foreach (var instance in uniquePkg.Instances)
                 {
-                    var info = await GetNugetInfo(pkg.Name, pkg.Version);
                     lock (libraries)
                     {
                         libraries.Add(new LibraryInfo
                         {
-                            Name = pkg.Name,
+                            Name = instance.Name,
                             Version = info.resolvedVersion,
                             ReleaseDate = info.releaseDate,
-                            Project = pkg.Project,
+                            Project = instance.Project,
                             NugetUrl = info.url,
                             Vulnerabilities = info.vulnerabilities,
                             Deprecation = info.deprecation
@@ -253,21 +287,24 @@ class Program
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Ошибка при обработке пакета {pkg.Name} {pkg.Version}: {ex.Message}");
+                Console.WriteLine($"Ошибка при обработке пакета {uniquePkg.Name} {uniquePkg.Version}: {ex.Message}");
             }
             finally
             {
                 semaphore.Release();
             }
         }).ToList();
+
         await Task.WhenAll(tasks);
         return libraries;
     }
 
+
     private static List<(string Project, string Name, string Version, string ReleaseDate, string NugetUrl, bool IsDll)> GetAllPackages(string[] csprojFiles)
     {
-        var allPackages = new List<(string Project, string Name, string Version, string ReleaseDate, string NugetUrl, bool IsDll)>();
-        foreach (var csproj in csprojFiles)
+        var allPackages = new ConcurrentBag<(string Project, string Name, string Version, string ReleaseDate, string NugetUrl, bool IsDll)>();
+        
+        Parallel.ForEach(csprojFiles, csproj =>
         {
             try
             {
@@ -326,28 +363,39 @@ class Program
             {
                 Console.WriteLine($"Ошибка при обработке файла {csproj}: {ex.Message}");
             }
-        }
-        return allPackages;
+        });
+        return [.. allPackages];
     }
+
 
     private static async Task<IEnumerable<NuGetVersion>> GetPackageVersionsAsync(string packageName)
     {
+        if (_versionsCache.TryGetValue(packageName.ToLowerInvariant(), out var cachedVersions))
+        {
+            return cachedVersions;
+        }
+
         try
         {
             var url = $"https://api.nuget.org/v3-flatcontainer/{packageName.ToLowerInvariant()}/index.json";
             var response = await HttpClient.GetStreamAsync(url);
             using var doc = await JsonDocument.ParseAsync(response);
-            return doc.RootElement.GetProperty("versions")
+            var versions = doc.RootElement.GetProperty("versions")
                 .EnumerateArray()
                 .Select(v => NuGetVersion.Parse(v.GetString()!))
                 .ToList();
+            
+            _versionsCache.TryAdd(packageName.ToLowerInvariant(), versions);
+            return versions;
         }
         catch (Exception ex)
         {
             Console.WriteLine($"Ошибка при получении версий пакета {packageName}: {ex.Message}");
-            return Enumerable.Empty<NuGetVersion>();
+            return [];
         }
     }
+
+    private static readonly ConcurrentDictionary<string, IEnumerable<NuGetVersion>> _versionsCache = new();
 
     static async Task<(string releaseDate, string url, List<VulnerabilityInfo> vulnerabilities, DeprecationInfo deprecation, string resolvedVersion)> GetNugetInfo(string packageName, string version)
     {
@@ -364,9 +412,24 @@ class Program
             }
         }
 
+        string cacheKey = $"{lowerName}|{resolvedVersion.ToLowerInvariant()}";
+        lock (_persistentCache)
+        {
+            if (_persistentCache.TryGetValue(cacheKey, out var entry))
+            {
+                // Если записи меньше 7 дней, используем её
+                if (DateTime.Now - entry.CachedAt < TimeSpan.FromDays(7))
+                {
+                    return (entry.ReleaseDate, entry.Url, entry.Vulnerabilities, entry.Deprecation, entry.ResolvedVersion);
+                }
+            }
+        }
+
         if (!NuGetVersion.TryParse(resolvedVersion, out var targetVersion))
         {
-            return ("", $"https://www.nuget.org/packages/{packageName}/{resolvedVersion}", new List<VulnerabilityInfo>(), null, resolvedVersion);
+            var result = ("", $"https://www.nuget.org/packages/{packageName}/{resolvedVersion}", new List<VulnerabilityInfo>(), new DeprecationInfo(), resolvedVersion);
+            UpdateCache(cacheKey, result);
+            return result;
         }
         var normalizedVersion = targetVersion.ToNormalizedString().ToLowerInvariant();
         
@@ -394,18 +457,22 @@ class Program
                 deprecation = ParseDeprecation(dProp);
             }
 
-        if (deprecation == null)
-        {
-            if (doc.RootElement.TryGetProperty("catalogEntry", out var catalogProp))
+            if (deprecation == null)
             {
-                var extra = await GetInfoFromCatalogProperty(catalogProp);
-                if (vulnerabilities.Count == 0) vulnerabilities = extra.vulnerabilities;
-                if (deprecation == null) deprecation = extra.deprecation;
+                if (doc.RootElement.TryGetProperty("catalogEntry", out var catalogProp))
+                {
+                    var extra = await GetInfoFromCatalogProperty(catalogProp);
+                    if (vulnerabilities.Count == 0) vulnerabilities = extra.vulnerabilities;
+                    if (deprecation == null) deprecation = extra.deprecation;
+                }
             }
-        }
 
-        if (!string.IsNullOrEmpty(published))
-            return (FormatDate(published), nugetUrl, vulnerabilities, deprecation, resolvedVersion);
+            if (!string.IsNullOrEmpty(published))
+            {
+                var res = (FormatDate(published), nugetUrl, vulnerabilities, deprecation, resolvedVersion);
+                UpdateCache(cacheKey, res);
+                return res;
+            }
         }
         catch (Exception ex)
         {
@@ -485,13 +552,17 @@ class Program
                         if (deprecation == null) deprecation = extra.deprecation;
                     }
 
-                    return (FormatDate(published), nugetUrl, vulnerabilities, deprecation, resolvedVersion);
+                    var res = (FormatDate(published), nugetUrl, vulnerabilities, deprecation, resolvedVersion);
+                    UpdateCache(cacheKey, res);
+                    return res;
                 }
             }
         }
         catch (Exception) { }
 
-        return (FormatDate(published), nugetUrl, vulnerabilities, deprecation, resolvedVersion);
+        var finalResult = (FormatDate(published), nugetUrl, vulnerabilities, deprecation, resolvedVersion);
+        UpdateCache(cacheKey, finalResult);
+        return finalResult;
     }
 
     private static string FormatDate(string dateStr)
@@ -747,6 +818,53 @@ class Program
         catch (Exception ex)
         {
             Console.WriteLine($"Ошибка при создании HTML-таблицы: {ex.Message}");
+        }
+    }
+
+    private static void LoadCache()
+    {
+        try
+        {
+            if (File.Exists(CacheFilePath))
+            {
+                var json = File.ReadAllText(CacheFilePath);
+                _persistentCache = JsonSerializer.Deserialize<Dictionary<string, NuGetCacheEntry>>(json) ?? new();
+                Console.WriteLine($"Загружено записей из кэша: {_persistentCache.Count}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Ошибка при загрузке кэша: {ex.Message}");
+        }
+    }
+
+    private static void SaveCache()
+    {
+        try
+        {
+            Directory.CreateDirectory(CacheDirectory);
+            var json = JsonSerializer.Serialize(_persistentCache, new JsonSerializerOptions { WriteIndented = true });
+            File.WriteAllText(CacheFilePath, json);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Ошибка при сохранении кэша: {ex.Message}");
+        }
+    }
+
+    private static void UpdateCache(string key, (string releaseDate, string url, List<VulnerabilityInfo> vulnerabilities, DeprecationInfo deprecation, string resolvedVersion) data)
+    {
+        lock (_persistentCache)
+        {
+            _persistentCache[key] = new NuGetCacheEntry
+            {
+                ReleaseDate = data.releaseDate,
+                Url = data.url,
+                Vulnerabilities = data.vulnerabilities,
+                Deprecation = data.deprecation,
+                ResolvedVersion = data.resolvedVersion,
+                CachedAt = DateTime.Now
+            };
         }
     }
 }
